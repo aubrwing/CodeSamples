@@ -1,0 +1,133 @@
+---
+title: "U.S. News & World Report R Coding Exercise Aubrey Winger"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+1)
+```{r}
+library(ggplot2)
+```
+
+```{r}
+library(tidyverse)
+usn_data <- read_csv("USNtest_R.csv")
+hospital_data <- read_csv("hospital_R.csv")
+
+```
+```{r}
+sum(!complete.cases(usn_data))
+```
+There are 1813 entries with missing data in the dataset. This data may have to be imputed or removed to use with machine learning models.
+```{r}
+#descriptive statistics
+summary(usn_data)
+```
+
+2)
+```{r}
+usn_senior <- filter(usn_data,age>=65)
+```
+3)
+```{r}
+#converting the date admit so it is in a usable format
+usn_senior$admitDate = as.Date(usn_senior$admitDate, "%d-%B-%y")
+usn_senior$readmission <- usn_senior %>%
+  group_by(patientId,admitDate)
+#creating a readmission column where 0 indicates no readmission and 1 indicates readmission
+usn_senior$readmission <- rep(0,nrow(usn_senior))
+#if the patientIds match, then combine the admittance dates. If the dates are less than 30 days apart, there was a readmission
+for(i in 1:(nrow(usn_senior)-1)){
+  if((usn_senior$patientId[i] == usn_senior$patientId[i+1]) && (as.numeric(difftime(usn_senior$admitDate[i],usn_senior$admitDate[i+1],units="days")<30))){
+    usn_senior$readmission[i]=1
+  }}
+```
+4)
+```{r}
+#seeing if any of the procedure columns have CABG codes
+# 1: admission involved CABG, 0:admission did not involve CABG
+codes <- c(3610,3611,3612,3613,3614,3615,3616)
+usn_senior$CABG <- ifelse(usn_senior$procedure1 %in% codes,1,ifelse(usn_senior$procedure2
+%in% codes,1,ifelse(usn_senior$procedure3 %in% codes,1,ifelse(usn_senior$procedure4 %in% codes,1,ifelse(usn_senior$procedure5 %in% codes,1,0)))))
+```
+5)
+```{r}
+library(comorbidity)
+```
+
+```{r}
+#coerced all the diagnostic data into one column so that it could be inputted into the comborbidity function
+comorb_calc = data.frame(usn_senior$patientId,usn_senior$diagnosis1,usn_senior$diagnosis2,usn_senior$diagnosis3,usn_senior$diagnosis4,usn_senior$diagnosis5)
+commorb_calc = comorb_calc %>% pivot_longer(!usn_senior.patientId,values_to="diagnosis") %>% select(-name)
+```
+
+
+```{r}
+#the com dataframe contains all the information asked for in question 5
+com <- comorbidity(commorb_calc,id="usn_senior.patientId",code="diagnosis",map="elixhauser_icd9_quan",assign0=TRUE)
+com$count <- rowSums(select(com,-usn_senior.patientId))
+```
+6)
+```{r}
+usn_combine <- merge(usn_senior,hospital_data,by="aha_id")
+```
+
+
+```{r}
+bar_data <- usn_combine %>% group_by(bdtot,CABG) %>% summarise(mean=mean(age)) 
+ggplot(bar_data,aes(x=factor(bdtot),y=mean,fill=factor(CABG),colour=factor(CABG)))+geom_bar(stat="identity",position="dodge")+xlab("Total Beds")+ylab("Mean Age")+ggtitle("Average Age By Bed Count For CABG and Non CABG Patients")+labs(colour="CABG Status",fill="CABG Status")
+```
+
+The average age seems pretty similar across the varying number of total beds, but is generally slightly lower for patients that have had coronary artery bypass graft surgery. Since the data is filtered to patients 65 or older, it makes sense why there is not much variation in average age. Interestingly, the greatest bed count (508) has a slightly higher average age for CABG patients compared to non CABG patients. A hypothesis that could be generated from this is that older patients that require CABG tend to go to larger hospitals.
+
+7)
+
+```{r}
+#putting the comorbidity counts into the main dataframe
+usn_combine = usn_combine %>%arrange(patientId)%>% mutate(id=row_number())
+regression_data <- usn_combine %>% filter(CABG==1) %>% arrange(patientId)
+com_count = data.frame(patientId=com$usn_senior.patientId,comorb=com$count)
+regression_data = left_join(regression_data,com_count,by="patientId")
+```
+
+```{r}
+#logistic regression model
+model <- glm(readmission~systolic+comorb,
+             data=regression_data,
+             family=binomial)
+```
+
+```{r}
+prob = predict(model,type="response")
+prob_readmit = data.frame(id = regression_data$id, patientId = regression_data$patientId,Prob_Readmission=prob)
+usn_combine = usn_combine %>% arrange(patientId)
+#final dataset with the probabilties of readmission
+final_dataset <- left_join(usn_combine,prob_readmit,by=c("patientId","id"))
+```
+8)
+```{r}
+summary(model)
+```
+Number of comorbidities is highly significant (alpha value <0.001). It is also positive, which indicates the number of comorbidities and patient readmission are positively correlated. This makes sense, because patients with a high number of comorbidities are more likely to have multiple hospital admissions. While controlling for systolic blood pressure, the estimated log odds of readmission increases 0.463982 for each additional comorbidity. Based on the Wald test, systolic blood pressure is not a significant predictor of readmission when number of comorbidities is in the model. 
+```{r}
+TS <- model$null.deviance-model$deviance
+1-pchisq(TS,2)
+```
+Using the delta G^2 test statistic, it can be concluded that the two predictor model is useful and should be chosen over an intercept only model. 
+```{r}
+predicted <- ifelse(prob>0.5,1,0)
+glm_pred = cbind(regression_data, predicted)
+
+glm_pred %>%
+  summarize(score = mean(predicted == readmission))
+```
+
+The model correctly predicted readmission 62% of the time. I chose logistic regression because it predicts class probability, which was the purpose of the model. This is a simple but powerful model, and made the most sense to use in the context of the problem. Additionally, readmission is a binary variable, and that is one of the primary assumptions of logistic regression. Other assumptions are that there is a linear relationship between the log of the outcome and each predictor variable, and that are no influential outliers or multicollinearity in the predictors. This assumptions could be evaluated using Cook's distance, the model residuals, and variance inflation factors.
+9)
+This graph shows the risk of mortality on a scale of 0 to 1 for several major diseases and surgeries for both white and black patients. Overall, black patients are shown to have a higher risk of mortality for aortic valve surgery, colon cancer surgery, heart bypass surgery. However, white patients have a much higher risk of mortality for heart failure, as well as a smaller risk of mortality for chronic obstructive pulmonary disease and lung cancer surgery. These results show a racial disparity in disease and treatment within our healthcare system,. However, this graph would benefit some additional context, such as the number of patients included in each group or some measure of hospital access.
+```{r}
+save.image("winger_usn_variables.Rdata")
+```
+
+
